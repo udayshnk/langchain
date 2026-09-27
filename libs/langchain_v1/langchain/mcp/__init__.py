@@ -4,6 +4,86 @@ Interrupt-driven elicitation has its own types — the interrupt payload, the
 answers a run resumes with, and the discriminator to recognize them by. Import
 those from `langchain.mcp.elicitation`.
 
+## Passing request metadata (`_meta`)
+
+MCP tools produced by this namespace can forward a `_meta` field to the server
+on every call. This is an MCP protocol-level field — the model never sees it —
+useful for passing tenant identifiers, correlation IDs, or session context.
+
+`_meta` forwarding is **opt-in**: pass an `MCPMetaConfig` to `MCPAdapter` or
+`as_langchain_tool`. `None` (the default) disables the feature entirely —
+nothing is read from `configurable` and no metadata is forwarded or surfaced.
+
+`MCPMetaConfig.key` names the `configurable` key this adapter reads at runtime.
+Different adapters in the same graph can use different keys to avoid collision.
+
+### Standalone clients
+
+For a standalone client, the value at `MCPMetaConfig.key` is forwarded directly:
+
+```python
+from langchain.mcp import MCPAdapter, MCPMetaConfig
+
+meta_cfg = MCPMetaConfig(key="mcp_meta")
+async with MCPAdapter("https://example.com/mcp", mcp_meta=meta_cfg) as adapter:
+    tools = await adapter.list_tools()
+
+await graph.ainvoke(
+    input,
+    config={
+        "configurable": {
+            "thread_id": "...",
+            "mcp_meta": {
+                "com.example/tenant-id": "acme",
+                "com.example/correlation-id": "req-123",
+            },
+        }
+    },
+)
+```
+
+### `ClientGroup` metadata
+
+For a `ClientGroup`, the same metadata dict is forwarded to every server in the
+group. Use a separate `MCPAdapter` with a different `MCPMetaConfig.key` for each
+server when per-server metadata is needed.
+
+```python
+meta_cfg = MCPMetaConfig(key="mcp_meta")
+async with MCPAdapter(group, mcp_meta=meta_cfg) as adapter:
+    tools = await adapter.list_tools()
+
+await graph.ainvoke(
+    input,
+    config={
+        "configurable": {
+            "mcp_meta": {
+                "com.example/tenant-id": "acme",
+                "com.example/correlation-id": "req-456",
+            },
+        }
+    },
+)
+```
+
+### Response metadata
+
+When `MCPMetaConfig.response_meta` is `True`, response `_meta` from the server
+is surfaced in `MCPToolArtifact.meta`. It defaults to `False` to avoid leaking
+server-internal keys into agent state.
+
+!!! note "Secrets in configurable"
+
+    `config["configurable"]` is visible to every tool, subgraph, and callback
+    in the run, and LangGraph may persist it via checkpointers. Prefer
+    non-sensitive identifiers (tenant ID, correlation ID) in `mcp_meta`. Source
+    credentials at call time from a secrets manager rather than storing them in
+    `configurable`.
+
+The metadata is forwarded as the MCP `_meta` protocol field to the server.
+In LangGraph, `configurable` is re-passed on every `ainvoke` — including
+resumes after an interrupt — so the values are always current.
+
 !!! warning "This namespace is in beta"
 
     `langchain.mcp` is actively being worked on and its API may change. Importing
@@ -17,7 +97,7 @@ import warnings
 from langchain_core._api import LangChainBetaWarning
 
 from langchain.mcp.adapter import MCPAdapter
-from langchain.mcp.tools import MCPToolArtifact, as_langchain_tool
+from langchain.mcp.tools import MCPMetaConfig, MCPToolArtifact, as_langchain_tool
 
 # Warned on import rather than through `@beta`, which annotates a function or
 # class and so only fires once something is called. The status belongs to the
@@ -31,6 +111,7 @@ warnings.warn(
 
 __all__ = [
     "MCPAdapter",
+    "MCPMetaConfig",
     "MCPToolArtifact",
     "as_langchain_tool",
 ]

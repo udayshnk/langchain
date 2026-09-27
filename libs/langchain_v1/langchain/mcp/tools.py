@@ -9,6 +9,7 @@ serving server's identity under `mcp.server`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
 from fastmcp.client.group import ClientGroup
@@ -20,6 +21,7 @@ from langchain_core.messages.content import (
     create_image_block,
     create_text_block,
 )
+from langchain_core.runnables import ensure_config
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from mcp.types import (
     AudioContent,
@@ -31,12 +33,38 @@ from mcp.types import (
     TextContent,
     TextResourceContents,
 )
+from typing_extensions import NotRequired
 
 from langchain.mcp.elicitation import _call_tool_with_interrupts, _drives_interrupts
 
 if TYPE_CHECKING:
     from fastmcp.client import Client
     from mcp.types import Tool
+
+
+@dataclass(frozen=True, kw_only=True)
+class MCPMetaConfig:
+    """Configuration for MCP `_meta` forwarding.
+
+    Controls how MCP protocol-level metadata is sent with tool calls and
+    surfaced from tool results. Pass this to `MCPAdapter` or `as_langchain_tool`
+    to opt in — `None` (the default) disables the feature entirely.
+
+    Attributes:
+        key: The key to look up in `config["configurable"]` at runtime. The
+            value at that key is forwarded as MCP `_meta` on every tool call.
+            Use different keys to keep multiple adapters in the same graph
+            independent of each other.
+        request_meta: Whether to forward metadata as MCP `_meta` on every
+            `tools/call`. Defaults to `True`.
+        response_meta: Whether to surface the server's response `_meta` in
+            `MCPToolArtifact`. Defaults to `False` to avoid leaking
+            server-internal keys into agent state.
+    """
+
+    key: str
+    request_meta: bool = True
+    response_meta: bool = False
 
 
 class _ToolCallResult(Protocol):
@@ -50,6 +78,7 @@ class _ToolCallResult(Protocol):
     content: list[ContentBlock]
     structured_content: dict[str, Any] | None
     is_error: bool
+    meta: dict[str, Any] | None
 
 
 ToolMessageContentBlock = TextContentBlock | ImageContentBlock | FileContentBlock
@@ -63,10 +92,15 @@ class MCPToolArtifact(TypedDict):
     MCP result fields without changing the artifact's shape.
 
     Attributes:
-        structured_content: The `structuredContent` of the MCP tool result.
+        structured_content: The `structuredContent` of the MCP tool result,
+            or `None` when the server returned none.
+        meta: The response metadata returned by the MCP server (`_meta` on the
+            wire). Present only when `MCPMetaConfig.response_meta` is `True`
+            and the server included metadata. Absent otherwise.
     """
 
     structured_content: Any
+    meta: NotRequired[dict[str, Any]]
 
 
 def _summarize_tool_error(tool_content: list[ToolMessageContentBlock]) -> str:
@@ -165,18 +199,43 @@ def _convert_content_block(content: ContentBlock) -> ToolMessageContentBlock:
     raise ValueError(msg)
 
 
+def _resolve_request_meta(
+    configurable: dict[str, Any],
+    config: MCPMetaConfig,
+) -> dict[str, Any] | None:
+    """Resolve the `_meta` value to forward from the current configurable.
+
+    Looks up `config.key` in `configurable` and returns it directly. Returns
+    `None` when forwarding is disabled or the key is absent.
+    """
+    if not config.request_meta:
+        return None
+    raw: Any = configurable.get(config.key)
+    if raw is not None and not isinstance(raw, dict):
+        msg = f"configurable[{config.key!r}] must be a dict or None, got {type(raw).__name__!r}"
+        raise TypeError(msg)
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
 def _convert_call_tool_result(
     result: _ToolCallResult,
+    *,
+    response_meta: bool = False,
 ) -> tuple[list[ToolMessageContentBlock], MCPToolArtifact | None]:
     """Split an MCP tool result into model-visible content and an artifact."""
     tool_content = [_convert_content_block(block) for block in result.content]
+    effective_meta = (result.meta or None) if response_meta else None
+    artifact: MCPToolArtifact | None = None
+    if result.structured_content is not None or effective_meta is not None:
+        artifact = MCPToolArtifact(structured_content=result.structured_content)
+        if effective_meta is not None:
+            artifact["meta"] = effective_meta
 
     if result.is_error:
         raise _MCPToolExecutionError(tool_content)
 
-    artifact: MCPToolArtifact | None = None
-    if result.structured_content is not None:
-        artifact = MCPToolArtifact(structured_content=result.structured_content)
     return tool_content, artifact
 
 
@@ -234,6 +293,8 @@ def _normalize_mcp_schema(schema: dict[str, Any]) -> dict[str, Any]:
 async def as_langchain_tool(
     tool: Tool,
     client: Client[Any] | ClientGroup,
+    *,
+    mcp_meta: MCPMetaConfig | None = None,
 ) -> BaseTool:
     """Convert one MCP tool into a LangChain tool.
 
@@ -257,6 +318,11 @@ async def as_langchain_tool(
     Args:
         tool: An MCP tool, as returned by `fastmcp.Client.list_tools`.
         client: The FastMCP client to call the tool through.
+        mcp_meta: Optional configuration for MCP `_meta` forwarding. Controls
+            which configurable key carries request metadata, whether to forward
+            it on calls, and whether to surface response metadata in the
+            artifact. `None` (default) disables `_meta` forwarding entirely —
+            see `langchain.mcp` for the full keying convention.
 
     Returns:
         A LangChain tool that invokes the MCP tool asynchronously.
@@ -265,13 +331,15 @@ async def as_langchain_tool(
         ```python
         from fastmcp import Client
 
-        from langchain.mcp import as_langchain_tool
+        from langchain.mcp import MCPMetaConfig, as_langchain_tool
 
         client = Client("https://example.com/mcp")
+        meta_cfg = MCPMetaConfig(key="mcp_meta")
         async with client:
             mcp_tools = await client.list_tools()
-        tools = [await as_langchain_tool(t, client) for t in mcp_tools]
+            tools = [await as_langchain_tool(t, client, mcp_meta=meta_cfg) for t in mcp_tools]
         ```
+
     """
     if isinstance(client, ClientGroup):
         tool_route = await client.resolve_tool(tool.name)
@@ -284,14 +352,28 @@ async def as_langchain_tool(
         **arguments: Any,
     ) -> tuple[list[ToolMessageContentBlock], MCPToolArtifact | None]:
         """Call the captured MCP tool and convert its result."""
+        # `ensure_config()` reads the current RunnableConfig from LangChain's
+        # async context — safe here because the tool is always called from within
+        # a LangChain runnable. A declared `config: RunnableConfig` parameter
+        # would collide with any MCP tool argument also named `config`, since the
+        # signature is `**arguments`.
+        configurable = ensure_config().get("configurable", {})
+        meta = (
+            _resolve_request_meta(configurable, mcp_meta) or None
+            if mcp_meta is not None
+            else None
+        )
         result: _ToolCallResult
         async with client:
             if drives_interrupts:
-                result = await _call_tool_with_interrupts(client, tool.name, arguments)
+                result = await _call_tool_with_interrupts(client, tool.name, arguments, meta=meta)
             else:
                 # Preserve MCP error results for conversion into failed tool messages.
-                result = await client.call_tool(tool.name, arguments, raise_on_error=False)
-        return _convert_call_tool_result(result)
+                result = await client.call_tool(
+                    tool.name, arguments, raise_on_error=False, meta=meta
+                )
+        include_response_meta = mcp_meta is not None and mcp_meta.response_meta
+        return _convert_call_tool_result(result, response_meta=include_response_meta)
 
     return StructuredTool(
         name=tool.name,
@@ -304,4 +386,4 @@ async def as_langchain_tool(
     )
 
 
-__all__ = ["MCPToolArtifact", "as_langchain_tool"]
+__all__ = ["MCPMetaConfig", "MCPToolArtifact", "as_langchain_tool"]
